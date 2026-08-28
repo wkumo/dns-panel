@@ -16,7 +16,7 @@ docker compose up --build -d
 
 访问 `http://localhost:48192`。首次登录账号和密码均为 `admin`，系统会要求修改账号、密码并填写邮箱。SQLite 数据通过 bind mount 持久化在 Compose 文件旁的 `data/` 目录，不使用 Docker named volume。
 
-Linux 部署前先创建可写的数据目录。默认以 UID/GID `1000:1000` 运行；如果部署用户不同，可以在 `.env` 中设置 `PUID` 和 `PGID`：
+Linux 部署时可以通过 `DATA_PATH` 指定宿主机数据目录。容器入口会按 `PUID`/`PGID` 修复挂载目录权限，然后立即切换为对应的非 root 用户运行服务：
 
 ```bash
 mkdir -p "$HOME/data"
