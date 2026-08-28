@@ -1,0 +1,18 @@
+.drag-handle{display:inline-block;margin-right:9px;color:#8a94a8;font-style:normal;font-size:20px;cursor:grab}
+.drag-handle.locked{cursor:not-allowed;opacity:.35}
+.monitor-toolbar{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:14px}.monitor-toolbar .monitor-hidden-toggle{margin:0}.monitor-count{font-size:13px;color:#68738a}.monitor-count b{color:#315efb;font-size:15px}
+.monitor-toolbar>div{display:flex;align-items:center;gap:12px}.monitor-toolbar button{padding:8px 12px}.https-exclusion-panel{display:grid;grid-template-columns:minmax(220px,1fr) minmax(320px,2fr) auto;align-items:center;gap:18px;margin-bottom:16px;padding:18px;background:#fff;border:1px solid #e1e6f0;border-radius:14px;box-shadow:0 8px 24px #1f29420d}.https-exclusion-panel h3{margin:0 0 5px}.https-exclusion-panel p{margin:0}.exclusion-domain-list{display:flex;flex-wrap:wrap;gap:8px}.exclusion-domain-list label{display:flex;align-items:center;gap:7px;margin:0;padding:8px 11px;background:#f5f7fb;border:1px solid #e1e6f0;border-radius:999px}.exclusion-domain-list input{width:auto;margin:0}
+.monitor-row.dragging{opacity:.35}
+.monitor-row.drag-over{box-shadow:inset 0 3px #315efb}
+.domain-row.dragging,.credential-row.dragging{opacity:.4}.domain-row.drag-over,.credential-row.drag-over{box-shadow:inset 0 3px #315efb}.managed-drag-handle{color:#68738a;cursor:grab;font-size:13px;font-weight:700}
+.last-checked{font-size:12px;color:#68738a}
+.quiet-hours{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.quiet-hours label{margin-top:0}
+.monitor-status.skipped{color:#8a6416;font-weight:700}
+.monitor-row input[data-monitor-hidden]:disabled{cursor:not-allowed;accent-color:#8a6416}
+.monitor-status.invalid{cursor:help;text-decoration:underline dotted;text-underline-offset:3px}
+.monitor-status.valid,.monitor-status.warning{cursor:help}
+.monitor-status.warning{color:#a66b00;font-weight:700;background:#fff4ce;padding:4px 7px;border-radius:6px}
+.monitor-row{grid-template-columns:1.6fr 80px 1.3fr 1.5fr 1.1fr 92px 60px}
+.monitor-row [data-monitor-check]{padding:7px 10px;font-size:12px;white-space:nowrap}
+@media(max-width:700px){.quiet-hours{grid-template-columns:1fr}.monitor-toolbar{align-items:flex-start;flex-direction:column}.https-exclusion-panel{grid-template-columns:1fr}}

@@ -1,0 +1,15 @@
+services:
+  dns-panel:
+    build: .
+    image: dns-panel:latest
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      PASSKEY_RP_ID: ${PASSKEY_RP_ID:-localhost}
+      PASSKEY_ORIGINS: ${PASSKEY_ORIGINS:-http://localhost:8080}
+      PUBLIC_URL: ${PUBLIC_URL:-http://localhost:8080}
+    volumes:
+      - dns-data:/data
+volumes:
+  dns-data:
