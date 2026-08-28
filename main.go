@@ -142,7 +142,7 @@ func main() {
 	m.HandleFunc("POST /api/https-monitors/{id}/check", a.auth(a.checkHTTPSMonitor))
 	dist, _ := fs.Sub(web, "web/dist")
 	m.Handle("/", http.FileServer(http.FS(dist)))
-	addr := env("LISTEN_ADDR", ":8080")
+	addr := env("LISTEN_ADDR", ":48192")
 	log.Printf("DNS Panel listening on %s", addr)
 	log.Fatal(http.ListenAndServe(addr, headers(m)))
 }
@@ -2342,7 +2342,7 @@ func (a *app) saveSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		origins := strings.TrimSpace(v["passkey_origins"])
 		if origins == "" {
-			origins = env("PASSKEY_ORIGINS", "http://localhost:8080")
+			origins = env("PASSKEY_ORIGINS", "http://localhost:48192")
 		}
 		var configErr error
 		pendingWebAuthn, configErr = buildWebAuthn(rpID, origins)
@@ -2416,7 +2416,7 @@ func (a *app) passkeySiteConfig() (origin, rpID string, err error) {
 	}
 	origin = strings.TrimSpace(a.setting("passkey_origins"))
 	if origin == "" {
-		origin = env("PASSKEY_ORIGINS", "http://localhost:8080")
+		origin = env("PASSKEY_ORIGINS", "http://localhost:48192")
 	}
 	return
 }

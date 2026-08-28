@@ -10,7 +10,6 @@ WORKDIR /app
 COPY --from=build /dns-panel /app/dns-panel
 RUN mkdir /data && chown app:app /data
 USER app
-ENV DATA_DIR=/data LISTEN_ADDR=:8080
-VOLUME ["/data"]
-EXPOSE 8080
+ENV DATA_DIR=/data LISTEN_ADDR=:48192
+EXPOSE 48192
 ENTRYPOINT ["/app/dns-panel"]

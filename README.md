@@ -14,7 +14,17 @@ go run .
 docker compose up --build -d
 ```
 
-访问 `http://localhost:8080`。首次登录账号和密码均为 `admin`，系统会要求修改账号、密码并填写邮箱。SQLite 数据保存在 `data/`，Docker 部署使用 `dns-data` volume。
+访问 `http://localhost:48192`。首次登录账号和密码均为 `admin`，系统会要求修改账号、密码并填写邮箱。SQLite 数据通过 bind mount 持久化在 Compose 文件旁的 `data/` 目录，不使用 Docker named volume。
+
+Linux 部署前先创建可写的数据目录。默认以 UID/GID `1000:1000` 运行；如果部署用户不同，可以在 `.env` 中设置 `PUID` 和 `PGID`：
+
+```bash
+mkdir -p data
+printf 'PUID=%s\nPGID=%s\n' "$(id -u)" "$(id -g)" > .env
+docker compose up -d
+```
+
+数据库文件实际位置为 `./data/dns-panel.db`，备份时应先停止服务，再复制整个 `data/` 目录。
 
 ## Cloudflare 配置
 
@@ -57,7 +67,7 @@ Passkey 使用浏览器原生 WebAuthn API 和服务端保存的临时 challenge
 
 ```text
 PASSKEY_RP_ID=localhost
-PASSKEY_ORIGINS=http://localhost:8080
+PASSKEY_ORIGINS=http://localhost:48192
 ```
 
 部署到正式域名时必须修改为实际域名和 HTTPS Origin，例如：

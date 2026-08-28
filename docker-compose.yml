@@ -3,13 +3,12 @@ services:
     build: .
     image: dns-panel:latest
     restart: unless-stopped
+    user: "${PUID:-1000}:${PGID:-1000}"
     ports:
-      - "8080:8080"
+      - "48192:48192"
     environment:
       PASSKEY_RP_ID: ${PASSKEY_RP_ID:-localhost}
-      PASSKEY_ORIGINS: ${PASSKEY_ORIGINS:-http://localhost:8080}
-      PUBLIC_URL: ${PUBLIC_URL:-http://localhost:8080}
+      PASSKEY_ORIGINS: ${PASSKEY_ORIGINS:-http://localhost:48192}
+      PUBLIC_URL: ${PUBLIC_URL:-http://localhost:48192}
     volumes:
-      - dns-data:/data
-volumes:
-  dns-data:
+      - ./data:/data
