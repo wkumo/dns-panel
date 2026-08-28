@@ -11,4 +11,4 @@ services:
       PASSKEY_ORIGINS: ${PASSKEY_ORIGINS:-http://localhost:48192}
       PUBLIC_URL: ${PUBLIC_URL:-http://localhost:48192}
     volumes:
-      - ./data:/data
+      - ${DATA_PATH:-./data}:/data

@@ -19,12 +19,12 @@ docker compose up --build -d
 Linux 部署前先创建可写的数据目录。默认以 UID/GID `1000:1000` 运行；如果部署用户不同，可以在 `.env` 中设置 `PUID` 和 `PGID`：
 
 ```bash
-mkdir -p data
-printf 'PUID=%s\nPGID=%s\n' "$(id -u)" "$(id -g)" > .env
+mkdir -p "$HOME/data"
+printf 'PUID=%s\nPGID=%s\nDATA_PATH=%s/data\n' "$(id -u)" "$(id -g)" "$HOME" > .env
 docker compose up -d
 ```
 
-数据库文件实际位置为 `./data/dns-panel.db`，备份时应先停止服务，再复制整个 `data/` 目录。
+上述示例会把数据库保存在当前 Linux 用户可写的 `$HOME/data/dns-panel.db`。如果不设置 `DATA_PATH`，默认位置仍是 Compose 文件旁的 `./data/dns-panel.db`。备份时应先停止服务，再复制整个数据目录。
 
 ## Cloudflare 配置
 
