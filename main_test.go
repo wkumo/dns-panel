@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/json"
 	"testing"
 	"time"
 )
@@ -42,6 +43,44 @@ func TestEncryptedBackupRoundTrip(t *testing.T) {
 	encrypted.Ciphertext = base64.RawStdEncoding.EncodeToString(ciphertext)
 	if _, err = decryptBackup("correct horse battery staple", encrypted); err == nil {
 		t.Fatal("tampered backup unexpectedly decrypted")
+	}
+}
+
+func TestCredentialEncryptionRoundTrip(t *testing.T) {
+	a := &app{credentialKey: bytes.Repeat([]byte{0x42}, 32)}
+	encrypted, err := a.encryptCredential("cloudflare-token", "access_key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if encrypted == "cloudflare-token" || !bytes.HasPrefix([]byte(encrypted), []byte(encryptedCredentialPrefix)) || bytes.Contains([]byte(encrypted), []byte("cloudflare-token")) {
+		t.Fatalf("credential was not safely encrypted: %q", encrypted)
+	}
+	plain, err := a.decryptCredential(encrypted, "access_key")
+	if err != nil || plain != "cloudflare-token" {
+		t.Fatalf("credential round trip failed: plain=%q err=%v", plain, err)
+	}
+	if _, err = a.decryptCredential(encrypted, "secret"); err == nil {
+		t.Fatal("ciphertext was accepted for a different credential field")
+	}
+	wrongKey := &app{credentialKey: bytes.Repeat([]byte{0x24}, 32)}
+	if _, err = wrongKey.decryptCredential(encrypted, "access_key"); err == nil {
+		t.Fatal("wrong master key unexpectedly decrypted credential")
+	}
+}
+
+func TestBackupHTTPSExclusionCompatibility(t *testing.T) {
+	var oldBackup, newBackup backupPayload
+	if err := json.Unmarshal([]byte(`{"version":1}`), &oldBackup); err != nil {
+		t.Fatal(err)
+	}
+	if oldBackup.HTTPSExcludedDomains != nil {
+		t.Fatal("old backup without exclusion field must not clear current exclusions")
+	}
+	if err := json.Unmarshal([]byte(`{"version":1,"httpsExcludedDomains":[]}`), &newBackup); err != nil {
+		t.Fatal(err)
+	}
+	if newBackup.HTTPSExcludedDomains == nil {
+		t.Fatal("explicit empty exclusion list must remain distinguishable")
 	}
 }
 

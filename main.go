@@ -44,8 +44,9 @@ import (
 var web embed.FS
 
 type app struct {
-	db       *sql.DB
-	webauthn *webauthn.WebAuthn
+	db            *sql.DB
+	webauthn      *webauthn.WebAuthn
+	credentialKey []byte
 }
 type ctxKey string
 
@@ -82,6 +83,9 @@ func main() {
 	db.SetMaxOpenConns(1)
 	a := &app{db: db}
 	if e = a.migrate(); e != nil {
+		log.Fatal(e)
+	}
+	if e = a.configureCredentialEncryption(dir); e != nil {
 		log.Fatal(e)
 	}
 	if e = a.bootstrap(); e != nil {
@@ -121,6 +125,7 @@ func main() {
 	m.HandleFunc("POST /api/me/mfa/passkey/finish", a.auth(a.finishMFAPasskey))
 	m.HandleFunc("GET /api/domains", a.auth(a.domains))
 	m.HandleFunc("POST /api/domains", a.auth(a.addDomain))
+	m.HandleFunc("PUT /api/domains/{id}", a.auth(a.updateDomain))
 	m.HandleFunc("PUT /api/domains/order", a.auth(a.orderDomains))
 	m.HandleFunc("DELETE /api/domains/{id}", a.auth(a.deleteDomain))
 	m.HandleFunc("GET /api/domains/{id}/records", a.auth(a.records))
@@ -150,6 +155,151 @@ func main() {
 	addr := env("LISTEN_ADDR", ":48192")
 	log.Printf("DNS Panel listening on %s", addr)
 	log.Fatal(http.ListenAndServe(addr, headers(m)))
+}
+
+const encryptedCredentialPrefix = "enc:v1:"
+
+func (a *app) configureCredentialEncryption(dataDir string) error {
+	var encoded []byte
+	if value := strings.TrimSpace(os.Getenv("DNS_PANEL_MASTER_KEY")); value != "" {
+		encoded = []byte(value)
+	} else if configuredPath := strings.TrimSpace(os.Getenv("DNS_PANEL_MASTER_KEY_FILE")); configuredPath != "" {
+		value, e := os.ReadFile(configuredPath)
+		if e != nil {
+			return fmt.Errorf("读取 API 凭据主密钥失败: %w", e)
+		}
+		encoded = value
+	} else {
+		keyPath := filepath.Join(dataDir, "master.key")
+		value, e := os.ReadFile(keyPath)
+		if os.IsNotExist(e) {
+			key := make([]byte, 32)
+			if _, e = rand.Read(key); e != nil {
+				return fmt.Errorf("生成 API 凭据主密钥失败: %w", e)
+			}
+			value = []byte(base64.StdEncoding.EncodeToString(key))
+			file, createErr := os.OpenFile(keyPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+			if createErr == nil {
+				_, createErr = file.Write(append(value, '\n'))
+				if closeErr := file.Close(); createErr == nil {
+					createErr = closeErr
+				}
+			}
+			if createErr != nil {
+				if existing, readErr := os.ReadFile(keyPath); readErr == nil {
+					value = existing
+				} else {
+					return fmt.Errorf("保存 API 凭据主密钥失败: %w", createErr)
+				}
+			}
+			log.Printf("已生成 API 凭据主密钥: %s；请与数据库一起备份，生产环境建议改用 DNS_PANEL_MASTER_KEY_FILE", keyPath)
+		} else if e != nil {
+			return fmt.Errorf("读取 API 凭据主密钥失败: %w", e)
+		}
+		encoded = value
+	}
+	key, e := base64.StdEncoding.DecodeString(strings.TrimSpace(string(encoded)))
+	if e != nil || len(key) != 32 {
+		return fmt.Errorf("API 凭据主密钥必须是 Base64 编码的 32 字节随机值")
+	}
+	a.credentialKey = append([]byte(nil), key...)
+	return a.migrateCredentialEncryption()
+}
+
+func (a *app) encryptCredential(value, field string) (string, error) {
+	if len(a.credentialKey) != 32 {
+		return "", fmt.Errorf("API 凭据主密钥未配置")
+	}
+	block, e := aes.NewCipher(a.credentialKey)
+	if e != nil {
+		return "", e
+	}
+	aead, e := cipher.NewGCM(block)
+	if e != nil {
+		return "", e
+	}
+	nonce := make([]byte, aead.NonceSize())
+	if _, e = rand.Read(nonce); e != nil {
+		return "", e
+	}
+	sealed := aead.Seal(nonce, nonce, []byte(value), []byte("dns-panel-credential-v1:"+field))
+	return encryptedCredentialPrefix + base64.RawStdEncoding.EncodeToString(sealed), nil
+}
+
+func (a *app) decryptCredential(value, field string) (string, error) {
+	if !strings.HasPrefix(value, encryptedCredentialPrefix) {
+		return "", fmt.Errorf("API 凭据仍为未加密格式")
+	}
+	if len(a.credentialKey) != 32 {
+		return "", fmt.Errorf("API 凭据主密钥未配置")
+	}
+	raw, e := base64.RawStdEncoding.DecodeString(strings.TrimPrefix(value, encryptedCredentialPrefix))
+	if e != nil {
+		return "", fmt.Errorf("API 凭据密文格式无效")
+	}
+	block, e := aes.NewCipher(a.credentialKey)
+	if e != nil {
+		return "", e
+	}
+	aead, e := cipher.NewGCM(block)
+	if e != nil || len(raw) < aead.NonceSize() {
+		return "", fmt.Errorf("API 凭据密文格式无效")
+	}
+	plain, e := aead.Open(nil, raw[:aead.NonceSize()], raw[aead.NonceSize():], []byte("dns-panel-credential-v1:"+field))
+	if e != nil {
+		return "", fmt.Errorf("API 凭据主密钥不匹配或密文已损坏")
+	}
+	return string(plain), nil
+}
+
+func (a *app) migrateCredentialEncryption() error {
+	type storedCredential struct{ id int64; accessKey, secret string }
+	rows, e := a.db.Query("SELECT id,access_key,secret FROM credentials ORDER BY id")
+	if e != nil {
+		return e
+	}
+	items := []storedCredential{}
+	for rows.Next() {
+		var item storedCredential
+		if e = rows.Scan(&item.id, &item.accessKey, &item.secret); e != nil {
+			rows.Close()
+			return e
+		}
+		items = append(items, item)
+	}
+	if e = rows.Err(); e != nil {
+		rows.Close()
+		return e
+	}
+	rows.Close()
+	tx, e := a.db.Begin()
+	if e != nil {
+		return e
+	}
+	defer tx.Rollback()
+	for _, item := range items {
+		accessKey, secret := item.accessKey, item.secret
+		if strings.HasPrefix(accessKey, encryptedCredentialPrefix) {
+			if _, e = a.decryptCredential(accessKey, "access_key"); e != nil {
+				return fmt.Errorf("API 凭据 %d 无法解密: %w", item.id, e)
+			}
+		} else if accessKey, e = a.encryptCredential(accessKey, "access_key"); e != nil {
+			return e
+		}
+		if strings.HasPrefix(secret, encryptedCredentialPrefix) {
+			if _, e = a.decryptCredential(secret, "secret"); e != nil {
+				return fmt.Errorf("API 凭据 %d 无法解密: %w", item.id, e)
+			}
+		} else if secret, e = a.encryptCredential(secret, "secret"); e != nil {
+			return e
+		}
+		if accessKey != item.accessKey || secret != item.secret {
+			if _, e = tx.Exec("UPDATE credentials SET access_key=?,secret=? WHERE id=?", accessKey, secret, item.id); e != nil {
+				return e
+			}
+		}
+	}
+	return tx.Commit()
 }
 func (a *app) migrate() error {
 	_, e := a.db.Exec(`PRAGMA foreign_keys=ON;PRAGMA journal_mode=WAL;
@@ -239,6 +389,9 @@ PRAGMA foreign_keys=ON;`)
 		return e
 	}
 	if e = a.ensureColumn("domains", "sort_order", "INTEGER NOT NULL DEFAULT 0"); e != nil {
+		return e
+	}
+	if e = a.ensureColumn("domains", "note", "TEXT NOT NULL DEFAULT ''"); e != nil {
 		return e
 	}
 	if e = a.ensureColumn("credentials", "sort_order", "INTEGER NOT NULL DEFAULT 0"); e != nil {
@@ -721,21 +874,26 @@ type backupCredential struct {
 	SortOrder                                int
 }
 type backupDomain struct {
-	Name, Provider, ZoneID, Credential string
-	SortOrder                          int
+	Name, Provider, ZoneID, Credential, Note string
+	SortOrder                                int
+}
+type backupDomainReference struct {
+	Name     string `json:"name"`
+	Provider string `json:"provider"`
 }
 type backupPersonal struct {
 	NameFilter, ValueFilter, BarkURL, BarkBody, HTTPSQuietStart, HTTPSQuietEnd string
 	HTTPSAlertLimit                                                            int
 }
 type backupPayload struct {
-	Version     int                `json:"version"`
-	ExportedAt  string             `json:"exportedAt"`
-	SourceRole  string             `json:"sourceRole"`
-	Credentials []backupCredential `json:"credentials"`
-	Domains     []backupDomain     `json:"domains"`
-	Personal    backupPersonal     `json:"personal"`
-	Global      map[string]string  `json:"global,omitempty"`
+	Version              int                     `json:"version"`
+	ExportedAt           string                  `json:"exportedAt"`
+	SourceRole           string                  `json:"sourceRole"`
+	Credentials          []backupCredential      `json:"credentials"`
+	Domains              []backupDomain          `json:"domains"`
+	Personal             backupPersonal          `json:"personal"`
+	HTTPSExcludedDomains []backupDomainReference `json:"httpsExcludedDomains,omitempty"`
+	Global               map[string]string       `json:"global,omitempty"`
 }
 type encryptedBackup struct {
 	Version    int    `json:"version"`
@@ -810,7 +968,7 @@ func decryptBackup(password string, in encryptedBackup) ([]byte, error) {
 }
 
 func (a *app) buildBackup(u user) (backupPayload, error) {
-	out := backupPayload{Version: 1, ExportedAt: time.Now().UTC().Format(time.RFC3339), SourceRole: u.Role, Credentials: []backupCredential{}, Domains: []backupDomain{}, Personal: backupPersonal{NameFilter: u.NameFilter, ValueFilter: u.ValueFilter, BarkURL: u.BarkURL, BarkBody: u.BarkBody, HTTPSQuietStart: u.HTTPSQuietStart, HTTPSQuietEnd: u.HTTPSQuietEnd, HTTPSAlertLimit: u.HTTPSAlertLimit}}
+	out := backupPayload{Version: 1, ExportedAt: time.Now().UTC().Format(time.RFC3339), SourceRole: u.Role, Credentials: []backupCredential{}, Domains: []backupDomain{}, HTTPSExcludedDomains: []backupDomainReference{}, Personal: backupPersonal{NameFilter: u.NameFilter, ValueFilter: u.ValueFilter, BarkURL: u.BarkURL, BarkBody: u.BarkBody, HTTPSQuietStart: u.HTTPSQuietStart, HTTPSQuietEnd: u.HTTPSQuietEnd, HTTPSAlertLimit: u.HTTPSAlertLimit}}
 	rows, e := a.db.Query("SELECT name,provider,access_key,secret,extra,sort_order FROM credentials WHERE user_id=? ORDER BY sort_order,id", u.ID)
 	if e != nil {
 		return out, e
@@ -821,22 +979,49 @@ func (a *app) buildBackup(u user) (backupPayload, error) {
 			rows.Close()
 			return out, e
 		}
+		if item.AccessKey, e = a.decryptCredential(item.AccessKey, "access_key"); e != nil {
+			rows.Close()
+			return out, e
+		}
+		if item.Secret, e = a.decryptCredential(item.Secret, "secret"); e != nil {
+			rows.Close()
+			return out, e
+		}
 		out.Credentials = append(out.Credentials, item)
 	}
 	if e = rows.Close(); e != nil {
 		return out, e
 	}
-	rows, e = a.db.Query(`SELECT d.name,d.provider,COALESCE(d.provider_zone_id,''),COALESCE(c.name,''),d.sort_order FROM domains d LEFT JOIN credentials c ON c.id=d.credential_id AND c.user_id=d.user_id WHERE d.user_id=? ORDER BY d.sort_order,d.id`, u.ID)
+	rows, e = a.db.Query(`SELECT d.name,d.provider,COALESCE(d.provider_zone_id,''),COALESCE(c.name,''),COALESCE(d.note,''),d.sort_order FROM domains d LEFT JOIN credentials c ON c.id=d.credential_id AND c.user_id=d.user_id WHERE d.user_id=? ORDER BY d.sort_order,d.id`, u.ID)
 	if e != nil {
 		return out, e
 	}
 	for rows.Next() {
 		var item backupDomain
-		if e = rows.Scan(&item.Name, &item.Provider, &item.ZoneID, &item.Credential, &item.SortOrder); e != nil {
+		if e = rows.Scan(&item.Name, &item.Provider, &item.ZoneID, &item.Credential, &item.Note, &item.SortOrder); e != nil {
 			rows.Close()
 			return out, e
 		}
 		out.Domains = append(out.Domains, item)
+	}
+	if e = rows.Err(); e != nil {
+		rows.Close()
+		return out, e
+	}
+	if e = rows.Close(); e != nil {
+		return out, e
+	}
+	rows, e = a.db.Query(`SELECT d.name,d.provider FROM https_domain_exclusions x JOIN domains d ON d.id=x.domain_id WHERE x.user_id=? AND d.user_id=? ORDER BY d.name,d.provider`, u.ID, u.ID)
+	if e != nil {
+		return out, e
+	}
+	for rows.Next() {
+		var item backupDomainReference
+		if e = rows.Scan(&item.Name, &item.Provider); e != nil {
+			rows.Close()
+			return out, e
+		}
+		out.HTTPSExcludedDomains = append(out.HTTPSExcludedDomains, item)
 	}
 	if e = rows.Err(); e != nil {
 		rows.Close()
@@ -958,7 +1143,15 @@ func (a *app) restoreBackup(userID int64, role string, payload backupPayload) er
 		if item.Name == "" || item.AccessKey == "" || item.Secret == "" || !validProvider(item.Provider) || !json.Valid([]byte(item.Extra)) {
 			return fmt.Errorf("API Key %q 数据无效", item.Name)
 		}
-		_, e = tx.Exec(`INSERT INTO credentials(user_id,name,provider,access_key,secret,extra,sort_order)VALUES(?,?,?,?,?,?,?) ON CONFLICT(user_id,name)DO UPDATE SET provider=excluded.provider,access_key=excluded.access_key,secret=excluded.secret,extra=excluded.extra,sort_order=excluded.sort_order`, userID, item.Name, item.Provider, item.AccessKey, item.Secret, item.Extra, item.SortOrder)
+		encryptedAccessKey, encryptErr := a.encryptCredential(item.AccessKey, "access_key")
+		if encryptErr != nil {
+			return encryptErr
+		}
+		encryptedSecret, encryptErr := a.encryptCredential(item.Secret, "secret")
+		if encryptErr != nil {
+			return encryptErr
+		}
+		_, e = tx.Exec(`INSERT INTO credentials(user_id,name,provider,access_key,secret,extra,sort_order)VALUES(?,?,?,?,?,?,?) ON CONFLICT(user_id,name)DO UPDATE SET provider=excluded.provider,access_key=excluded.access_key,secret=excluded.secret,extra=excluded.extra,sort_order=excluded.sort_order`, userID, item.Name, item.Provider, encryptedAccessKey, encryptedSecret, item.Extra, item.SortOrder)
 		if e != nil {
 			return e
 		}
@@ -978,9 +1171,31 @@ func (a *app) restoreBackup(userID int64, role string, payload backupPayload) er
 		if e = tx.QueryRow("SELECT provider FROM credentials WHERE id=? AND user_id=?", credentialID, userID).Scan(&credentialProvider); e != nil || credentialProvider != item.Provider {
 			return fmt.Errorf("域名 %q 的厂商与 API Key 不匹配", item.Name)
 		}
-		_, e = tx.Exec(`INSERT INTO domains(user_id,name,provider,provider_zone_id,credential_id,sort_order)VALUES(?,?,?,?,?,?) ON CONFLICT(user_id,name,provider)DO UPDATE SET provider_zone_id=excluded.provider_zone_id,credential_id=excluded.credential_id,sort_order=excluded.sort_order`, userID, item.Name, item.Provider, item.ZoneID, credentialID, item.SortOrder)
+		_, e = tx.Exec(`INSERT INTO domains(user_id,name,provider,provider_zone_id,credential_id,note,sort_order)VALUES(?,?,?,?,?,?,?) ON CONFLICT(user_id,name,provider)DO UPDATE SET provider_zone_id=excluded.provider_zone_id,credential_id=excluded.credential_id,note=excluded.note,sort_order=excluded.sort_order`, userID, item.Name, item.Provider, item.ZoneID, credentialID, item.Note, item.SortOrder)
 		if e != nil {
 			return e
+		}
+	}
+	if payload.HTTPSExcludedDomains != nil {
+		if _, e = tx.Exec("DELETE FROM https_domain_exclusions WHERE user_id=?", userID); e != nil {
+			return e
+		}
+		seenExclusions := map[string]bool{}
+		for _, item := range payload.HTTPSExcludedDomains {
+			item.Name = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(item.Name)), ".")
+			item.Provider = strings.ToLower(strings.TrimSpace(item.Provider))
+			key := item.Provider + "\x00" + item.Name
+			if item.Name == "" || !validProvider(item.Provider) || seenExclusions[key] {
+				return fmt.Errorf("HTTPS 排除域名 %q 数据无效或重复", item.Name)
+			}
+			seenExclusions[key] = true
+			result, insertErr := tx.Exec(`INSERT INTO https_domain_exclusions(user_id,domain_id) SELECT ?,id FROM domains WHERE user_id=? AND name=? AND provider=?`, userID, userID, item.Name, item.Provider)
+			if insertErr != nil {
+				return insertErr
+			}
+			if affected, _ := result.RowsAffected(); affected != 1 {
+				return fmt.Errorf("HTTPS 排除域名 %q 不存在", item.Name)
+			}
 		}
 	}
 	if payload.Personal.HTTPSAlertLimit < 1 || payload.Personal.HTTPSAlertLimit > 100 {
@@ -1555,7 +1770,7 @@ func (a *app) adminResetPassword(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *app) domains(w http.ResponseWriter, r *http.Request) {
-	rows, e := a.db.Query(`SELECT d.id,d.name,d.provider,COALESCE(d.provider_zone_id,''),COALESCE(d.credential_id,0),COALESCE(c.name,'') FROM domains d LEFT JOIN credentials c ON c.id=d.credential_id WHERE d.user_id=? ORDER BY d.sort_order,d.id`, current(r).ID)
+	rows, e := a.db.Query(`SELECT d.id,d.name,d.provider,COALESCE(d.provider_zone_id,''),COALESCE(d.credential_id,0),COALESCE(c.name,''),COALESCE(d.note,'') FROM domains d LEFT JOIN credentials c ON c.id=d.credential_id AND c.user_id=d.user_id WHERE d.user_id=? ORDER BY d.sort_order,d.id`, current(r).ID)
 	if e != nil {
 		fail(w, 500, e.Error())
 		return
@@ -1564,23 +1779,23 @@ func (a *app) domains(w http.ResponseWriter, r *http.Request) {
 	out := []map[string]any{}
 	for rows.Next() {
 		var id, cid int64
-		var n, p, z, c string
-		rows.Scan(&id, &n, &p, &z, &cid, &c)
-		out = append(out, map[string]any{"id": id, "name": n, "provider": p, "zoneId": z, "credentialId": cid, "credential": c})
+		var n, p, z, c, note string
+		rows.Scan(&id, &n, &p, &z, &cid, &c, &note)
+		out = append(out, map[string]any{"id": id, "name": n, "provider": p, "zoneId": z, "credentialId": cid, "credential": c, "note": note})
 	}
 	jsonOut(w, 200, out)
 }
 func (a *app) addDomain(w http.ResponseWriter, r *http.Request) {
 	var v struct {
-		Name, Provider, ZoneID string
-		CredentialID           int64
+		Name, Provider, ZoneID, Note string
+		CredentialID                 int64
 	}
 	if !decode(w, r, &v) {
 		return
 	}
 	v.Name = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(v.Name)), ".")
 	v.Provider = strings.ToLower(v.Provider)
-	if v.Name == "" || !validProvider(v.Provider) || v.CredentialID < 1 {
+	if v.Name == "" || !validProvider(v.Provider) || v.CredentialID < 1 || len([]rune(v.Note)) > 500 {
 		fail(w, 400, "域名、提供商或 API Key 无效")
 		return
 	}
@@ -1589,13 +1804,27 @@ func (a *app) addDomain(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, "API Key 不属于当前用户或厂商不匹配")
 		return
 	}
-	res, e := a.db.Exec("INSERT INTO domains(user_id,name,provider,provider_zone_id,credential_id,sort_order)VALUES(?,?,?,?,?,COALESCE((SELECT MAX(sort_order)+1 FROM domains WHERE user_id=?),0))", current(r).ID, v.Name, v.Provider, v.ZoneID, v.CredentialID, current(r).ID)
+	res, e := a.db.Exec("INSERT INTO domains(user_id,name,provider,provider_zone_id,credential_id,note,sort_order)VALUES(?,?,?,?,?,?,COALESCE((SELECT MAX(sort_order)+1 FROM domains WHERE user_id=?),0))", current(r).ID, v.Name, v.Provider, v.ZoneID, v.CredentialID, v.Note, current(r).ID)
 	if e != nil {
 		fail(w, 409, "域名已存在或 API Key 无效")
 		return
 	}
 	id, _ := res.LastInsertId()
 	jsonOut(w, 201, map[string]any{"id": id})
+}
+func (a *app) updateDomain(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Note string `json:"note"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	if len([]rune(in.Note)) > 500 {
+		fail(w, 400, "域名备注不能超过 500 个字符")
+		return
+	}
+	res, e := a.db.Exec("UPDATE domains SET note=? WHERE id=? AND user_id=?", in.Note, r.PathValue("id"), current(r).ID)
+	result(w, res, e)
 }
 func (a *app) deleteDomain(w http.ResponseWriter, r *http.Request) {
 	res, e := a.db.Exec("DELETE FROM domains WHERE id=? AND user_id=?", r.PathValue("id"), current(r).ID)
@@ -1709,6 +1938,12 @@ func (a *app) cloudflareDomain(userID int64, id string) (cfDomain, error) {
 	}
 	if provider != "cloudflare" {
 		return d, fmt.Errorf("该域名不是 Cloudflare 域名")
+	}
+	if accessKey, e = a.decryptCredential(accessKey, "access_key"); e != nil {
+		return d, e
+	}
+	if secret, e = a.decryptCredential(secret, "secret"); e != nil {
+		return d, e
 	}
 	d.Token = accessKey
 	if d.Token == "" {
@@ -2011,7 +2246,14 @@ func (a *app) credentials(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var id int64
 		var n, p, k, t string
-		rows.Scan(&id, &n, &p, &k, &t)
+		if e = rows.Scan(&id, &n, &p, &k, &t); e != nil {
+			fail(w, 500, e.Error())
+			return
+		}
+		if k, e = a.decryptCredential(k, "access_key"); e != nil {
+			fail(w, 500, e.Error())
+			return
+		}
 		if len(k) > 4 {
 			k = "****" + k[len(k)-4:]
 		} else {
@@ -2038,7 +2280,17 @@ func (a *app) addCredential(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	x, _ := json.Marshal(v.Extra)
-	res, e := a.db.Exec("INSERT INTO credentials(user_id,name,provider,access_key,secret,extra,sort_order)VALUES(?,?,?,?,?,?,COALESCE((SELECT MAX(sort_order)+1 FROM credentials WHERE user_id=?),0))", current(r).ID, v.Name, v.Provider, v.AccessKey, v.Secret, string(x), current(r).ID)
+	encryptedAccessKey, e := a.encryptCredential(v.AccessKey, "access_key")
+	if e != nil {
+		fail(w, 500, e.Error())
+		return
+	}
+	encryptedSecret, e := a.encryptCredential(v.Secret, "secret")
+	if e != nil {
+		fail(w, 500, e.Error())
+		return
+	}
+	res, e := a.db.Exec("INSERT INTO credentials(user_id,name,provider,access_key,secret,extra,sort_order)VALUES(?,?,?,?,?,?,COALESCE((SELECT MAX(sort_order)+1 FROM credentials WHERE user_id=?),0))", current(r).ID, v.Name, v.Provider, encryptedAccessKey, encryptedSecret, string(x), current(r).ID)
 	if e != nil {
 		fail(w, 409, "名称已存在")
 		return

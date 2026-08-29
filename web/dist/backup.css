@@ -44,6 +44,45 @@
 .backup-form input[type="file"] { padding: 8px; background: #f7f8fb; }
 .backup-form button { height: 42px; }
 .backup-card > .hint { margin-bottom: 0; }
+.table-search {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: min(680px, 100%);
+  margin: 14px 0 18px;
+  padding: 12px 14px;
+  border: 1px solid #e1e5ee;
+  border-radius: 12px;
+  background: white;
+}
+.table-search span { min-width: 92px; color: #59657b; font-size: 12px; font-weight: 700; }
+.table-search input { margin: 0; }
+.domain-row { grid-template-columns: 32px 1.25fr .7fr 1fr 1.15fr 1.4fr 72px !important; }
+.domain-row .managed-drag-handle,.drag-column {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 34px;
+  color: #69738a;
+  cursor: grab;
+  font-size: 18px;
+  user-select: none;
+}
+.credential-row { grid-template-columns: 32px 1.2fr .8fr 1.2fr 1.4fr 72px !important; }
+.credential-row .managed-drag-handle {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 34px;
+  color: #69738a;
+  cursor: grab;
+  font-size: 18px;
+  user-select: none;
+}
+.credential-row .managed-drag-handle:active { cursor: grabbing; }
+.domain-row .managed-drag-handle:active { cursor: grabbing; }
+.domain-note { margin: 0; min-width: 150px; }
+.domain-form { grid-template-columns: 1.2fr 1.2fr 1.2fr 1.5fr auto !important; }
 @media (max-width: 1150px) {
   .nav { padding: 8px; }
 }
@@ -51,4 +90,6 @@
   .view-search-bar { padding: 10px 18px; }
   .header-search span { display: none; }
   .backup-form { grid-template-columns: 1fr; }
+  .table-search { align-items: stretch; flex-direction: column; gap: 6px; }
+  .domain-form { grid-template-columns: 1fr !important; }
 }

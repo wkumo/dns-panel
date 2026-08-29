@@ -77,10 +77,10 @@ docker login --username YOUR_DOCKER_ID
 服务器和目标机器都是 `linux/amd64` 时：
 
 ```bash
-docker tag dns-panel:latest YOUR_DOCKER_ID/dns-panel:v1.0.0
-docker tag dns-panel:latest YOUR_DOCKER_ID/dns-panel:latest
-docker push YOUR_DOCKER_ID/dns-panel:v1.0.0
-docker push YOUR_DOCKER_ID/dns-panel:latest
+docker tag dns-panel:latest wkkm/dns-panel:v0.0.2
+docker tag dns-panel:latest wkkm/dns-panel:latest
+docker push wkkm/dns-panel:v1.0.0
+docker push wkkm/dns-panel:latest
 ```
 
 ### 6B. 发布 AMD64 与 ARM64（推荐公开发布时使用）
@@ -89,11 +89,11 @@ docker push YOUR_DOCKER_ID/dns-panel:latest
 docker buildx create --name dns-panel-builder --driver docker-container --use --bootstrap
 docker buildx build \
   --platform linux/amd64,linux/arm64 \
-  -t YOUR_DOCKER_ID/dns-panel:v1.0.0 \
-  -t YOUR_DOCKER_ID/dns-panel:latest \
+  -t wkkm/dns-panel:v0.0.2 \
+  -t wkkm/dns-panel:latest \
   --push .
 
-docker buildx imagetools inspect YOUR_DOCKER_ID/dns-panel:v1.0.0
+docker buildx imagetools inspect wkkm/dns-panel:v0.0.2
 ```
 
 ### 7. 在正式服务器部署已发布镜像
@@ -103,7 +103,7 @@ docker buildx imagetools inspect YOUR_DOCKER_ID/dns-panel:v1.0.0
 ```yaml
 services:
   dns-panel:
-    image: YOUR_DOCKER_ID/dns-panel:v1.0.0
+    image: wkkm/dns-panel:v1.0.0
     restart: unless-stopped
     ports:
       - "48192:48192"
@@ -148,6 +148,32 @@ docker compose up --build -d
 ```
 
 访问 `http://localhost:48192`。首次登录账号和密码均为 `admin`，系统会要求修改账号、密码并填写邮箱。SQLite 数据通过 bind mount 持久化在 Compose 文件旁的 `data/` 目录，不使用 Docker named volume。
+
+### API 凭据主密钥
+
+SQLite 中的 API Key/Secret 使用 AES-256-GCM 加密保存。每条字段使用独立随机 Nonce，并绑定字段类型作为认证数据；应用仅在调用云厂商、显示脱敏后缀或生成密码加密备份时于内存中解密。已有数据库中的明文凭据会在升级后的首次启动时自动事务迁移。
+
+本地开发未配置密钥时，应用会自动创建 `DATA_DIR/master.key`（权限 `0600`）。生产环境应将密钥放在数据库目录之外，并通过只读文件注入：
+
+```bash
+sudo install -d -m 700 /etc/dns-panel
+openssl rand -base64 32 | sudo tee /etc/dns-panel/master.key >/dev/null
+sudo chmod 600 /etc/dns-panel/master.key
+```
+
+在生产服务器创建 `docker-compose.override.yml`：
+
+```yaml
+services:
+  dns-panel:
+    environment:
+      DNS_PANEL_MASTER_KEY: ""
+      DNS_PANEL_MASTER_KEY_FILE: /run/secrets/dns-panel-master-key
+    volumes:
+      - /etc/dns-panel/master.key:/run/secrets/dns-panel-master-key:ro
+```
+
+然后执行 `docker compose up -d`。也可以用 `DNS_PANEL_MASTER_KEY` 直接传入 Base64 密钥，但文件方式可避免密钥出现在 Compose 配置和环境变量中。密钥丢失后 API 凭据无法恢复；密钥错误或密文被篡改时应用会拒绝启动。备份时应分别安全保存数据库和主密钥，不能把主密钥写入导出的 JSON。
 
 Linux 部署时可以通过 `DATA_PATH` 指定宿主机数据目录。容器入口会按 `PUID`/`PGID` 修复挂载目录权限，然后立即切换为对应的非 root 用户运行服务：
 
@@ -237,4 +263,4 @@ HTTPS 监控每小时自动运行，也可在页面手动执行。默认访问 `
 
 阿里云、腾讯云的真实同步尚未实现。
 
-生产部署前还应使用主密钥加密 SQLite 中保存的 API Secret，并在反向代理层启用 HTTPS。
+生产部署时还应在反向代理层启用 HTTPS。
