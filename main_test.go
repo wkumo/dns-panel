@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"encoding/base64"
 	"testing"
 	"time"
 )
@@ -13,6 +15,33 @@ func TestValidTOTP(t *testing.T) {
 	}
 	if validTOTP(secret, "000000", time.Unix(59, 0)) {
 		t.Fatal("unexpected invalid TOTP acceptance")
+	}
+}
+
+func TestEncryptedBackupRoundTrip(t *testing.T) {
+	plain := []byte(`{"version":1,"secret":"cloud-token"}`)
+	encrypted, err := encryptBackup("correct horse battery staple", plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains([]byte(encrypted.Ciphertext), []byte("cloud-token")) {
+		t.Fatal("encrypted backup leaked plaintext secret")
+	}
+	decrypted, err := decryptBackup("correct horse battery staple", encrypted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(decrypted, plain) {
+		t.Fatalf("decrypted backup differs: %q", decrypted)
+	}
+	if _, err = decryptBackup("wrong password", encrypted); err == nil {
+		t.Fatal("wrong password unexpectedly decrypted backup")
+	}
+	ciphertext, _ := base64.RawStdEncoding.DecodeString(encrypted.Ciphertext)
+	ciphertext[len(ciphertext)-1] ^= 1
+	encrypted.Ciphertext = base64.RawStdEncoding.EncodeToString(ciphertext)
+	if _, err = decryptBackup("correct horse battery staple", encrypted); err == nil {
+		t.Fatal("tampered backup unexpectedly decrypted")
 	}
 }
 

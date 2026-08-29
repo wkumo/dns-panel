@@ -2,6 +2,139 @@
 
 使用 Go、原生 Web 前端和 SQLite 构建的自托管 DNS 管理面板。构建需要 Go 1.25 或更高版本。
 
+## Linux 构建、测试与发布到 Docker Hub
+
+以下示例假设源码位于 `/opt/dns-panel-build`，Docker Hub 用户名为 `YOUR_DOCKER_ID`，发布版本为 `v1.0.0`。
+
+### 1. 准备源码和数据目录
+
+```bash
+cd /opt/dns-panel-build
+git pull
+
+export PUID="$(id -u)"
+export PGID="$(id -g)"
+export DATA_PATH="/opt/dns-panel-build/data"
+```
+
+构建上下文通过 `.dockerignore` 排除 `data/` 和 `*.db`，SQLite 数据不会进入镜像。运行时 `DATA_PATH` 会绑定到容器 `/data`；入口脚本先修复目录权限，再以 `PUID:PGID` 降权运行服务。
+
+### 2. 运行源代码测试
+
+如果服务器安装了 Go 1.25 或更高版本：
+
+```bash
+go test ./...
+```
+
+没有安装 Go 时，可以直接使用官方 Go 容器运行测试：
+
+```bash
+docker run --rm \
+  -v "$PWD:/src" \
+  -w /src \
+  golang:1.25-alpine \
+  go test ./...
+```
+
+### 3. 构建本机架构镜像
+
+```bash
+docker compose down
+docker compose build --no-cache
+docker image inspect dns-panel:latest >/dev/null
+```
+
+### 4. 本地容器测试
+
+```bash
+docker compose up -d
+docker compose ps
+docker compose logs --tail=100 dns-panel
+curl --fail http://127.0.0.1:48192/api/policy
+```
+
+浏览器访问 `http://服务器IP:48192`，至少验证登录、SMTP、Cloudflare 拉取/同步、SQLite 持久化和容器重启：
+
+```bash
+docker compose restart dns-panel
+test -f "$DATA_PATH/dns-panel.db"
+curl --fail http://127.0.0.1:48192/api/policy
+```
+
+### 5. 登录 Docker Hub
+
+先在 Docker Hub 创建 `dns-panel` 仓库和具有 Read/Write 权限的 Access Token，然后在服务器执行：
+
+```bash
+docker login --username YOUR_DOCKER_ID
+```
+
+密码位置粘贴 Access Token，不要把 Token 写进源码、Compose 或 Shell 历史。
+
+### 6A. 发布当前服务器架构
+
+服务器和目标机器都是 `linux/amd64` 时：
+
+```bash
+docker tag dns-panel:latest YOUR_DOCKER_ID/dns-panel:v1.0.0
+docker tag dns-panel:latest YOUR_DOCKER_ID/dns-panel:latest
+docker push YOUR_DOCKER_ID/dns-panel:v1.0.0
+docker push YOUR_DOCKER_ID/dns-panel:latest
+```
+
+### 6B. 发布 AMD64 与 ARM64（推荐公开发布时使用）
+
+```bash
+docker buildx create --name dns-panel-builder --driver docker-container --use --bootstrap
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  -t YOUR_DOCKER_ID/dns-panel:v1.0.0 \
+  -t YOUR_DOCKER_ID/dns-panel:latest \
+  --push .
+
+docker buildx imagetools inspect YOUR_DOCKER_ID/dns-panel:v1.0.0
+```
+
+### 7. 在正式服务器部署已发布镜像
+
+正式服务器的 Compose 应删除 `build: .`，并固定版本：
+
+```yaml
+services:
+  dns-panel:
+    image: YOUR_DOCKER_ID/dns-panel:v1.0.0
+    restart: unless-stopped
+    ports:
+      - "48192:48192"
+    environment:
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+    volumes:
+      - ${DATA_PATH:-./data}:/data
+```
+
+部署与升级：
+
+```bash
+export PUID="$(id -u)"
+export PGID="$(id -g)"
+export DATA_PATH="/opt/dns-panel/data"
+
+docker compose pull
+docker compose up -d
+docker compose ps
+docker compose logs --tail=100 dns-panel
+```
+
+发布新版本时使用新标签，例如 `v1.0.1`；正式服务器不要只依赖 `latest`，这样可以把 Compose 标签改回上一版本快速回滚。升级前先停止服务并备份整个数据目录：
+
+```bash
+docker compose stop dns-panel
+tar czf "dns-panel-data-$(date +%F-%H%M%S).tar.gz" -C "$DATA_PATH" .
+docker compose start dns-panel
+```
+
 ## 启动
 
 ```bash
@@ -58,6 +191,8 @@ docker compose up -d
 - 管理员用户后台支持 50 条/页、OTP/Passkey 状态和强制密码重置
 - 忘记密码邮件包含用户名和一小时有效的一次性重置链接
 - HTTPS 监控汇总 A、AAAA、CNAME，支持端口、备注、排序、屏蔽、完整证书链检查、邮件和 Bark 告警
+- DNS、HTTPS、域名、API Key 和用户管理页面支持 Header 关键字即时筛选
+- 个人中心支持 AES-256-GCM 加密导入/导出；管理员备份额外包含全部全局设置
 
 ## OTP 与 Passkey
 
@@ -100,6 +235,6 @@ HTTPS 监控每小时自动运行，也可在页面手动执行。默认访问 `
 
 ## 尚未完成
 
-阿里云、腾讯云的真实同步，以及 OTP 与 Passkey 验证流程尚未实现。
+阿里云、腾讯云的真实同步尚未实现。
 
 生产部署前还应使用主密钥加密 SQLite 中保存的 API Secret，并在反向代理层启用 HTTPS。

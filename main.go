@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha1"
@@ -34,6 +36,7 @@ import (
 	"github.com/go-webauthn/webauthn/webauthn"
 
 	"golang.org/x/crypto/bcrypt"
+	"golang.org/x/crypto/scrypt"
 	_ "modernc.org/sqlite"
 )
 
@@ -101,6 +104,8 @@ func main() {
 	m.HandleFunc("POST /api/me/profile/request", a.auth(a.profileRequest))
 	m.HandleFunc("POST /api/me/profile/confirm", a.auth(a.profileConfirm))
 	m.HandleFunc("POST /api/me/bark/test", a.auth(a.testBark))
+	m.HandleFunc("POST /api/me/backup/export", a.auth(a.exportBackup))
+	m.HandleFunc("POST /api/me/backup/import", a.auth(a.importBackup))
 	m.HandleFunc("GET /api/me/otp", a.auth(a.listOTP))
 	m.HandleFunc("POST /api/me/otp", a.auth(a.beginOTP))
 	m.HandleFunc("POST /api/me/otp/{id}/confirm", a.auth(a.confirmOTP))
@@ -709,6 +714,293 @@ func (a *app) applyProfile(id int64, v profileChange) error {
 	h, _ := bcrypt.GenerateFromPassword([]byte(v.NewPassword), bcrypt.DefaultCost)
 	_, e := a.db.Exec("UPDATE users SET username=?,email=?,name_filter=?,value_filter=?,bark_url=?,bark_body=?,https_quiet_start=?,https_quiet_end=?,https_alert_limit=?,password_hash=?,email_verified=1 WHERE id=?", v.Username, v.Email, v.NameFilter, v.ValueFilter, v.BarkURL, v.BarkBody, v.HTTPSQuietStart, v.HTTPSQuietEnd, v.HTTPSAlertLimit, h, id)
 	return e
+}
+
+type backupCredential struct {
+	Name, Provider, AccessKey, Secret, Extra string
+	SortOrder                                int
+}
+type backupDomain struct {
+	Name, Provider, ZoneID, Credential string
+	SortOrder                          int
+}
+type backupPersonal struct {
+	NameFilter, ValueFilter, BarkURL, BarkBody, HTTPSQuietStart, HTTPSQuietEnd string
+	HTTPSAlertLimit                                                            int
+}
+type backupPayload struct {
+	Version     int                `json:"version"`
+	ExportedAt  string             `json:"exportedAt"`
+	SourceRole  string             `json:"sourceRole"`
+	Credentials []backupCredential `json:"credentials"`
+	Domains     []backupDomain     `json:"domains"`
+	Personal    backupPersonal     `json:"personal"`
+	Global      map[string]string  `json:"global,omitempty"`
+}
+type encryptedBackup struct {
+	Version    int    `json:"version"`
+	Cipher     string `json:"cipher"`
+	KDF        string `json:"kdf"`
+	Salt       string `json:"salt"`
+	Nonce      string `json:"nonce"`
+	Ciphertext string `json:"ciphertext"`
+}
+
+func backupAEAD(password string, salt []byte) (cipher.AEAD, error) {
+	if len([]rune(password)) < 8 {
+		return nil, fmt.Errorf("备份密码至少需要 8 个字符")
+	}
+	key, e := scrypt.Key([]byte(password), salt, 32768, 8, 1, 32)
+	if e != nil {
+		return nil, e
+	}
+	block, e := aes.NewCipher(key)
+	if e != nil {
+		return nil, e
+	}
+	return cipher.NewGCM(block)
+}
+
+func encryptBackup(password string, plain []byte) (encryptedBackup, error) {
+	var out encryptedBackup
+	salt := make([]byte, 16)
+	if _, e := rand.Read(salt); e != nil {
+		return out, e
+	}
+	aead, e := backupAEAD(password, salt)
+	if e != nil {
+		return out, e
+	}
+	nonce := make([]byte, aead.NonceSize())
+	if _, e = rand.Read(nonce); e != nil {
+		return out, e
+	}
+	ciphertext := aead.Seal(nil, nonce, plain, []byte("dns-panel-backup-v1"))
+	return encryptedBackup{Version: 1, Cipher: "AES-256-GCM", KDF: "scrypt-N32768-r8-p1", Salt: base64.RawStdEncoding.EncodeToString(salt), Nonce: base64.RawStdEncoding.EncodeToString(nonce), Ciphertext: base64.RawStdEncoding.EncodeToString(ciphertext)}, nil
+}
+
+func decryptBackup(password string, in encryptedBackup) ([]byte, error) {
+	if in.Version != 1 || in.Cipher != "AES-256-GCM" || in.KDF != "scrypt-N32768-r8-p1" {
+		return nil, fmt.Errorf("不支持的备份格式")
+	}
+	salt, e := base64.RawStdEncoding.DecodeString(in.Salt)
+	if e != nil || len(salt) != 16 {
+		return nil, fmt.Errorf("备份 Salt 无效")
+	}
+	nonce, e := base64.RawStdEncoding.DecodeString(in.Nonce)
+	if e != nil {
+		return nil, fmt.Errorf("备份 Nonce 无效")
+	}
+	ciphertext, e := base64.RawStdEncoding.DecodeString(in.Ciphertext)
+	if e != nil {
+		return nil, fmt.Errorf("备份密文无效")
+	}
+	aead, e := backupAEAD(password, salt)
+	if e != nil {
+		return nil, e
+	}
+	if len(nonce) != aead.NonceSize() {
+		return nil, fmt.Errorf("备份 Nonce 长度无效")
+	}
+	plain, e := aead.Open(nil, nonce, ciphertext, []byte("dns-panel-backup-v1"))
+	if e != nil {
+		return nil, fmt.Errorf("密码错误或备份文件已损坏")
+	}
+	return plain, nil
+}
+
+func (a *app) buildBackup(u user) (backupPayload, error) {
+	out := backupPayload{Version: 1, ExportedAt: time.Now().UTC().Format(time.RFC3339), SourceRole: u.Role, Credentials: []backupCredential{}, Domains: []backupDomain{}, Personal: backupPersonal{NameFilter: u.NameFilter, ValueFilter: u.ValueFilter, BarkURL: u.BarkURL, BarkBody: u.BarkBody, HTTPSQuietStart: u.HTTPSQuietStart, HTTPSQuietEnd: u.HTTPSQuietEnd, HTTPSAlertLimit: u.HTTPSAlertLimit}}
+	rows, e := a.db.Query("SELECT name,provider,access_key,secret,extra,sort_order FROM credentials WHERE user_id=? ORDER BY sort_order,id", u.ID)
+	if e != nil {
+		return out, e
+	}
+	for rows.Next() {
+		var item backupCredential
+		if e = rows.Scan(&item.Name, &item.Provider, &item.AccessKey, &item.Secret, &item.Extra, &item.SortOrder); e != nil {
+			rows.Close()
+			return out, e
+		}
+		out.Credentials = append(out.Credentials, item)
+	}
+	if e = rows.Close(); e != nil {
+		return out, e
+	}
+	rows, e = a.db.Query(`SELECT d.name,d.provider,COALESCE(d.provider_zone_id,''),COALESCE(c.name,''),d.sort_order FROM domains d LEFT JOIN credentials c ON c.id=d.credential_id AND c.user_id=d.user_id WHERE d.user_id=? ORDER BY d.sort_order,d.id`, u.ID)
+	if e != nil {
+		return out, e
+	}
+	for rows.Next() {
+		var item backupDomain
+		if e = rows.Scan(&item.Name, &item.Provider, &item.ZoneID, &item.Credential, &item.SortOrder); e != nil {
+			rows.Close()
+			return out, e
+		}
+		out.Domains = append(out.Domains, item)
+	}
+	if e = rows.Err(); e != nil {
+		rows.Close()
+		return out, e
+	}
+	if e = rows.Close(); e != nil {
+		return out, e
+	}
+	if u.Role == "admin" {
+		out.Global = map[string]string{}
+		settingsRows, queryErr := a.db.Query("SELECT key,value FROM settings")
+		if queryErr != nil {
+			return out, queryErr
+		}
+		defer settingsRows.Close()
+		for settingsRows.Next() {
+			var key, value string
+			if queryErr = settingsRows.Scan(&key, &value); queryErr != nil {
+				return out, queryErr
+			}
+			out.Global[key] = value
+		}
+		if queryErr = settingsRows.Err(); queryErr != nil {
+			return out, queryErr
+		}
+	}
+	return out, nil
+}
+
+func (a *app) exportBackup(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Password string `json:"password"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	payload, e := a.buildBackup(current(r))
+	if e != nil {
+		fail(w, 500, "无法读取备份数据："+e.Error())
+		return
+	}
+	plain, _ := json.Marshal(payload)
+	encrypted, e := encryptBackup(in.Password, plain)
+	if e != nil {
+		fail(w, 400, e.Error())
+		return
+	}
+	w.Header().Set("Content-Disposition", `attachment; filename="dns-panel-backup.json"`)
+	jsonOut(w, 200, encrypted)
+}
+
+func (a *app) importBackup(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Password string          `json:"password"`
+		Data     encryptedBackup `json:"data"`
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 12<<20)
+	if e := json.NewDecoder(r.Body).Decode(&in); e != nil {
+		fail(w, 400, "备份请求无效或超过 12 MB")
+		return
+	}
+	plain, e := decryptBackup(in.Password, in.Data)
+	if e != nil {
+		fail(w, 400, e.Error())
+		return
+	}
+	var payload backupPayload
+	if e = json.Unmarshal(plain, &payload); e != nil || payload.Version != 1 {
+		fail(w, 400, "备份内容无效")
+		return
+	}
+	if len(payload.Credentials) > 1000 || len(payload.Domains) > 10000 {
+		fail(w, 400, "备份数据量超过限制")
+		return
+	}
+	if current(r).Role != "admin" {
+		payload.Global = nil
+	}
+	var importedWebAuthn *webauthn.WebAuthn
+	if current(r).Role == "admin" && payload.Global != nil {
+		rpID, origins := strings.TrimSpace(payload.Global["passkey_rp_id"]), strings.TrimSpace(payload.Global["passkey_origins"])
+		if siteURL := strings.TrimSpace(payload.Global["site_url"]); siteURL != "" {
+			_, rpID, origins, e = parseSiteURL(siteURL)
+			if e != nil {
+				fail(w, 400, "备份中的站点 URL 无效："+e.Error())
+				return
+			}
+		}
+		if rpID == "" {
+			rpID = env("PASSKEY_RP_ID", "localhost")
+		}
+		if origins == "" {
+			origins = env("PASSKEY_ORIGINS", "http://localhost:48192")
+		}
+		if importedWebAuthn, e = buildWebAuthn(rpID, origins); e != nil {
+			fail(w, 400, "备份中的 Passkey 配置无效："+e.Error())
+			return
+		}
+	}
+	if e = a.restoreBackup(current(r).ID, current(r).Role, payload); e != nil {
+		fail(w, 400, "导入失败："+e.Error())
+		return
+	}
+	if importedWebAuthn != nil {
+		a.webauthn = importedWebAuthn
+	}
+	jsonOut(w, 200, map[string]int{"credentials": len(payload.Credentials), "domains": len(payload.Domains)})
+}
+
+func (a *app) restoreBackup(userID int64, role string, payload backupPayload) error {
+	tx, e := a.db.Begin()
+	if e != nil {
+		return e
+	}
+	defer tx.Rollback()
+	credentialIDs := map[string]int64{}
+	for _, item := range payload.Credentials {
+		item.Name, item.Provider = strings.TrimSpace(item.Name), strings.ToLower(strings.TrimSpace(item.Provider))
+		if item.Name == "" || item.AccessKey == "" || item.Secret == "" || !validProvider(item.Provider) || !json.Valid([]byte(item.Extra)) {
+			return fmt.Errorf("API Key %q 数据无效", item.Name)
+		}
+		_, e = tx.Exec(`INSERT INTO credentials(user_id,name,provider,access_key,secret,extra,sort_order)VALUES(?,?,?,?,?,?,?) ON CONFLICT(user_id,name)DO UPDATE SET provider=excluded.provider,access_key=excluded.access_key,secret=excluded.secret,extra=excluded.extra,sort_order=excluded.sort_order`, userID, item.Name, item.Provider, item.AccessKey, item.Secret, item.Extra, item.SortOrder)
+		if e != nil {
+			return e
+		}
+		var id int64
+		if e = tx.QueryRow("SELECT id FROM credentials WHERE user_id=? AND name=?", userID, item.Name).Scan(&id); e != nil {
+			return e
+		}
+		credentialIDs[item.Name] = id
+	}
+	for _, item := range payload.Domains {
+		item.Name, item.Provider = strings.TrimSpace(item.Name), strings.ToLower(strings.TrimSpace(item.Provider))
+		credentialID, ok := credentialIDs[item.Credential]
+		if !ok || item.Name == "" || !validProvider(item.Provider) {
+			return fmt.Errorf("域名 %q 的 API Key 关联无效", item.Name)
+		}
+		var credentialProvider string
+		if e = tx.QueryRow("SELECT provider FROM credentials WHERE id=? AND user_id=?", credentialID, userID).Scan(&credentialProvider); e != nil || credentialProvider != item.Provider {
+			return fmt.Errorf("域名 %q 的厂商与 API Key 不匹配", item.Name)
+		}
+		_, e = tx.Exec(`INSERT INTO domains(user_id,name,provider,provider_zone_id,credential_id,sort_order)VALUES(?,?,?,?,?,?) ON CONFLICT(user_id,name,provider)DO UPDATE SET provider_zone_id=excluded.provider_zone_id,credential_id=excluded.credential_id,sort_order=excluded.sort_order`, userID, item.Name, item.Provider, item.ZoneID, credentialID, item.SortOrder)
+		if e != nil {
+			return e
+		}
+	}
+	if payload.Personal.HTTPSAlertLimit < 1 || payload.Personal.HTTPSAlertLimit > 100 {
+		payload.Personal.HTTPSAlertLimit = 1
+	}
+	if _, e = tx.Exec("UPDATE users SET name_filter=?,value_filter=?,bark_url=?,bark_body=?,https_quiet_start=?,https_quiet_end=?,https_alert_limit=? WHERE id=?", payload.Personal.NameFilter, payload.Personal.ValueFilter, payload.Personal.BarkURL, payload.Personal.BarkBody, payload.Personal.HTTPSQuietStart, payload.Personal.HTTPSQuietEnd, payload.Personal.HTTPSAlertLimit, userID); e != nil {
+		return e
+	}
+	if role == "admin" && payload.Global != nil {
+		for key, value := range payload.Global {
+			result, updateErr := tx.Exec("UPDATE settings SET value=? WHERE key=?", value, key)
+			if updateErr != nil {
+				return updateErr
+			}
+			if changed, _ := result.RowsAffected(); changed == 0 {
+				continue
+			}
+		}
+	}
+	return tx.Commit()
 }
 
 type webUser struct {

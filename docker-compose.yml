@@ -1,7 +1,7 @@
 services:
   dns-panel:
     build: .
-    image: dns-panel:latest
+    image: wkkm/dns-panel:latest
     restart: unless-stopped
     ports:
       - "48192:48192"
