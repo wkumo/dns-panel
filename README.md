@@ -77,9 +77,9 @@ docker login --username YOUR_DOCKER_ID
 服务器和目标机器都是 `linux/amd64` 时：
 
 ```bash
-docker tag dns-panel:latest wkkm/dns-panel:v0.0.4
+docker tag dns-panel:latest wkkm/dns-panel:v0.0.5
 docker tag dns-panel:latest wkkm/dns-panel:latest
-docker push wkkm/dns-panel:v0.0.4
+docker push wkkm/dns-panel:v0.0.5
 docker push wkkm/dns-panel:latest
 ```
 
