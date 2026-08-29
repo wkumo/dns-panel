@@ -11,7 +11,6 @@ services:
       PASSKEY_RP_ID: ${PASSKEY_RP_ID:-localhost}
       PASSKEY_ORIGINS: ${PASSKEY_ORIGINS:-http://localhost:48192}
       PUBLIC_URL: ${PUBLIC_URL:-http://localhost:48192}
-      # 生产环境请在 .env 中设置由 `openssl rand -base64 32` 生成的值。
       # 留空时应用会在 /data/master.key 自动生成本地开发密钥。
       DNS_PANEL_MASTER_KEY: ${DNS_PANEL_MASTER_KEY:-}
     volumes:

@@ -2,6 +2,43 @@
 
 使用 Go、原生 Web 前端和 SQLite 构建的自托管 DNS 管理面板。构建需要 Go 1.25 或更高版本。
 
+## docker发布
+```bash
+mkdir /opt/dns-panel
+```
+配置.env
+````
+DNS_PANEL_MASTER_KEY的值由openssl rand -base64 32获取生成
+````
+````
+PUID=0
+PGID=0
+DNS_PANEL_MASTER_KEY=
+PASSKEY_RP_ID=test.example.com
+PASSKEY_ORIGINS=https://test.example.com
+PUBLIC_URL=https://test.example.com
+````
+````
+services:
+  dns-panel:
+    build: .
+    image: dns-panel:latest
+    restart: unless-stopped
+    ports:
+      - "48192:48192"
+    environment:
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+      PASSKEY_RP_ID: ${PASSKEY_RP_ID:-localhost}
+      PASSKEY_ORIGINS: ${PASSKEY_ORIGINS:-http://localhost:48192}
+      PUBLIC_URL: ${PUBLIC_URL:-http://localhost:48192}
+      # 留空时应用会在 /data/master.key 自动生成本地开发密钥。
+      DNS_PANEL_MASTER_KEY: ${DNS_PANEL_MASTER_KEY:-}
+    volumes:
+      - ${DATA_PATH:-./data}:/data
+
+````
+
 ## 本地开发
 
 ```bash
