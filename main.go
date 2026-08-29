@@ -1733,9 +1733,21 @@ func (a *app) listUsers(w http.ResponseWriter, r *http.Request) {
 	if per < 1 || per > 50 {
 		per = 50
 	}
+	query := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("q")))
 	var total int
-	a.db.QueryRow("SELECT COUNT(*) FROM users").Scan(&total)
-	rows, e := a.db.Query(`SELECT u.id,u.username,u.email,u.role,u.must_change_password,(SELECT COUNT(*) FROM otp_credentials o WHERE o.user_id=u.id AND o.enabled=1),(SELECT COUNT(*) FROM passkey_credentials p WHERE p.user_id=u.id) FROM users u ORDER BY u.id LIMIT ? OFFSET ?`, per, (page-1)*per)
+	var rows *sql.Rows
+	var e error
+	if query == "" {
+		e = a.db.QueryRow("SELECT COUNT(*) FROM users").Scan(&total)
+		if e == nil {
+			rows, e = a.db.Query(`SELECT u.id,u.username,u.email,u.role,u.must_change_password,(SELECT COUNT(*) FROM otp_credentials o WHERE o.user_id=u.id AND o.enabled=1),(SELECT COUNT(*) FROM passkey_credentials p WHERE p.user_id=u.id) FROM users u ORDER BY u.id LIMIT ? OFFSET ?`, per, (page-1)*per)
+		}
+	} else {
+		e = a.db.QueryRow(`SELECT COUNT(*) FROM users WHERE INSTR(LOWER(username),?)>0 OR INSTR(LOWER(email),?)>0 OR INSTR(LOWER(role),?)>0`, query, query, query).Scan(&total)
+		if e == nil {
+			rows, e = a.db.Query(`SELECT u.id,u.username,u.email,u.role,u.must_change_password,(SELECT COUNT(*) FROM otp_credentials o WHERE o.user_id=u.id AND o.enabled=1),(SELECT COUNT(*) FROM passkey_credentials p WHERE p.user_id=u.id) FROM users u WHERE INSTR(LOWER(u.username),?)>0 OR INSTR(LOWER(u.email),?)>0 OR INSTR(LOWER(u.role),?)>0 ORDER BY u.id LIMIT ? OFFSET ?`, query, query, query, per, (page-1)*per)
+		}
+	}
 	if e != nil {
 		fail(w, 500, e.Error())
 		return
